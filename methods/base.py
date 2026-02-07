@@ -9,7 +9,7 @@ from scipy.spatial.distance import cdist
 
 EPSILON = 1e-8
 batch_size = 64
-
+#python main.py --device 0 --config configs/cifar100_inflora_debug.json
 class BaseLearner(object):
     def __init__(self, args):
         self._cur_task = -1

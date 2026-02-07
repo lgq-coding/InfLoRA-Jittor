@@ -169,26 +169,58 @@ class DataManager(object):
         idxes = np.where(np.logical_and(y >= low_range, y < high_range))[0]
         return x[idxes], y[idxes]
 
+# def pil_loader(path):
+#     """加载图像文件的辅助函数"""
+#     with open(path, 'rb') as f:
+#         img = Image.open(f)
+#         return img.convert('RGB')
 
 class DummyDataset(Dataset):  # 基类已替换为jittor.dataset.Dataset
     def __init__(self, images, labels, trsf, use_path=False):
+        super().__init__()
         assert len(images) == len(labels), 'Data size error!'
         self.images = images
         self.labels = labels
         self.trsf = trsf
         self.use_path = use_path
-
-    def __len__(self):
-        return len(self.images)
+        self.set_attrs(total_len=len(self.images))  # Jittor数据集需要设置总长度
 
     def __getitem__(self, idx):
+        index=idx
         if self.use_path:
-            image = self.trsf(pil_loader(self.images[idx]))
+            # 从路径加载图像
+            image = pil_loader(self.images[idx])
         else:
-            image = self.trsf(Image.fromarray(self.images[idx]))
+            # 从数组创建图像
+            # 确保图像数组是正确的数据类型和形状
+            img_data = self.images[idx]
+            if not isinstance(img_data, np.ndarray):
+                img_data = np.array(img_data)
+            if img_data.dtype != np.uint8:
+                img_data = img_data.astype(np.uint8)
+            image = Image.fromarray(img_data)
+        
+        # 应用转换
+        if self.trsf is not None:
+            image = self.trsf(image)
+        if hasattr(image, 'numpy'):
+            # 如果是 PyTorch Tensor
+            image = image.numpy()
+        elif hasattr(image, 'data'):
+            # 如果是 Jittor Var
+            image = image.data
+        elif isinstance(image, Image.Image):
+            # 如果是 PIL Image，转换为 numpy 数组
+            image = np.array(image)
+        
+        # 确保图像形状是 HWC 格式（如果是 CHW 格式，需要转置）
+        if len(image.shape) == 3 and image.shape[0] <= 3:
+            # 假设是 CHW 格式，转换为 HWC
+            image = np.transpose(image, (1, 2, 0))
+            
         label = self.labels[idx]
-
-        return idx, image, label
+    
+        return index,image, label
 
 
 def _map_new_class_index(y, order):

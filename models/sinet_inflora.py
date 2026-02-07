@@ -3,7 +3,7 @@ import jittor as jt
 import jittor.nn as nn
 from copy import deepcopy
 
-
+##等待修改！！！
 # ===============================
 #   ViT wrapper (unchanged)
 # ===============================
@@ -14,8 +14,10 @@ class ViT_lora_co(nn.Module):
 
     def forward(self, x, task_id=0, get_cur_feat=False):
         return self.backbone(x, task_id=task_id, get_cur_feat=get_cur_feat)
-
-
+    
+    def execute(self, x, task_id=None, get_cur_feat=False):
+        return self.forward(x, task_id=task_id, get_cur_feat=get_cur_feat)
+    
 # ===============================
 #   SiNet for InfLoRA
 # ===============================
@@ -26,8 +28,8 @@ class SiNet(nn.Module):
         self.args = args
         self.backbone = ViT_lora_co(backbone)
 
-        self.embd_dim = args.embd_dim
-        self.class_num = args.init_cls
+        self.embd_dim = args['embd_dim']
+        self.class_num = args['init_cls']
 
         # current task index
         self.numtask = 0

@@ -13,7 +13,7 @@ import jittor.nn as nn
 from jittor import optim
 
 from sklearn.cluster import KMeans
-
+# python main.py --device 0 --config configs/cifar100_inflora_debug.json
 from .base import BaseLearner
 from models.sinet_inflora import SiNet
 from models.vit_inflora import Attention_LoRA
@@ -54,7 +54,7 @@ class InfLoRA(BaseLearner):
         # Network
         # ----------------------------------------------------
         if args["net_type"] == "sip":
-            self._network = SiNet(args)
+            self._network = SiNet(nn.Module,args)
         else:
             raise ValueError("Unknown net type")
 

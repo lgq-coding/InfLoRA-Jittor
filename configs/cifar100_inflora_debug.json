@@ -1,7 +1,7 @@
 {
   "prefix": "reproduce_debug",
   "dataset": "cifar100",
-  "data_path": "root/autodl-pub/cifar-100/",
+  "data_path": "data/",
   "memory_size": 0,
   "memory_per_class": 0,
   "fixed_memory": true,
