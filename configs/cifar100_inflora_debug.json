@@ -30,5 +30,6 @@
   "rank": 4,
   "lamb": 0.95,
   "lame": 1.0,
-  "num_workers": 2
+  "num_workers": 2,
+  "in_chans": 3
 }
