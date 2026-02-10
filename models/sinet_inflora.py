@@ -389,23 +389,10 @@ class SiNet(nn.Module):
         print(f"SiNet execute input shape: {image.shape}")
         
         # 在进入 image_encoder 之前，先确保图像维度正确
-        if len(image.shape) == 4:
-            B, C, H, W = image.shape
-            # 如果通道数不是3，尝试自动修正
-            if C != 3:
-                print(f"Warning: Input image has {C} channels, expected 3")
-                
-                # 尝试判断维度顺序
-                if C == 224 and (H == 224 or H == 3) and (W == 3 or W == 224):
-                    # 可能是 BHWC 格式
-                    if H == 3:
-                        image = image.permute(0, 3, 1, 2)  # (B, H, W, C) -> (B, C, H, W)
-                    elif W == 3:
-                        image = image.permute(0, 3, 1, 2)  # (B, C, H, 3) -> (B, 3, C, H)
-                    else:
-                        # 尝试将最后一个维度移到第二维
-                        image = image.permute(0, 3, 1, 2)
-                    print(f"Auto-corrected image shape to: {image.shape}")
+        if len(image.shape) == 4 and image.shape[-1] == 3:
+            # BHWC 转换为 BCHW
+            image = image.permute(0, 3, 1, 2)
+            print(f"Permuted image shape: {image.shape}")
         
         if fc_only:
             fc_outs = []
@@ -414,9 +401,36 @@ class SiNet(nn.Module):
                 fc_outs.append(fc_out)
             return jt.concat(fc_outs, dim=1)
 
+        # 确保有分类器可用
+        if self.numtask <= 0:
+            print(f"Warning: numtask={self.numtask}, no classifier available")
+            # 返回一个默认的输出
+            batch_size = image.shape[0]
+            return {
+                'logits': jt.zeros((batch_size, self.class_num)),
+                'features': jt.zeros((batch_size, self.embd_dim)),
+                'prompt_loss': jt.zeros((1,))
+            }
+        
+        # 确保索引有效
+        task_idx = self.numtask - 1
+        if task_idx < 0 or task_idx >= len(self.classifier_pool):
+            print(f"Warning: Invalid task index {task_idx}, classifier_pool length: {len(self.classifier_pool)}")
+            # 使用第一个分类器或创建一个临时的
+            if len(self.classifier_pool) > 0:
+                task_idx = 0
+            else:
+                # 创建一个临时分类器
+                batch_size = image.shape[0]
+                return {
+                    'logits': jt.zeros((batch_size, self.class_num)),
+                    'features': jt.zeros((batch_size, self.embd_dim)),
+                    'prompt_loss': jt.zeros((1,))
+                }
+        
         image_features, prompt_loss = self.image_encoder(
             image, 
-            task_id=self.numtask-1, 
+            task_id=task_idx, 
             get_feat=get_feat, 
             get_cur_feat=get_cur_feat
         )
@@ -425,7 +439,7 @@ class SiNet(nn.Module):
         
         # 使用当前任务的分类器
         logits = []
-        for prompts in [self.classifier_pool[self.numtask-1]]:
+        for prompts in [self.classifier_pool[task_idx]]:
             logits.append(prompts(image_features))
 
         return {
@@ -440,16 +454,36 @@ class SiNet(nn.Module):
     def interface(self, image, task_id=None):
         if task_id is None:
             task_id = self.numtask - 1
-            
+        
+        # 确保 task_id 有效
+        if task_id < 0:
+            print(f"Warning: task_id={task_id} is negative, using 0")
+            task_id = 0
+        
+        # 确保图像维度正确
+        if len(image.shape) == 4 and image.shape[-1] == 3:
+            image = image.permute(0, 3, 1, 2)
+        
         image_features, _ = self.image_encoder(image, task_id=task_id)
         image_features = image_features[:, 0, :]
         image_features = image_features.view(image_features.shape[0], -1)
 
         logits = []
-        for prompt in self.classifier_pool[:self.numtask]:
-            logits.append(prompt(image_features))
-
-        return jt.concat(logits, dim=1)
+        # 确保有分类器可用
+        if len(self.classifier_pool) > 0:
+            for prompt in self.classifier_pool[:self.numtask]:
+                logits.append(prompt(image_features))
+        
+        # 确保返回的是二维张量 [batch_size, num_classes]
+        if len(logits) > 0:
+            result = jt.concat(logits, dim=1)
+            return result
+        else:
+            print("interface: no logits available")
+            # 返回一个零张量
+            batch_size = image.shape[0]
+            num_classes = self.class_num if hasattr(self, 'class_num') else 10
+            return jt.zeros((batch_size, num_classes))
     
     def interface1(self, image, task_ids):
         logits = []
