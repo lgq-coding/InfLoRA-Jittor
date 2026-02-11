@@ -93,12 +93,13 @@ class InfLoRA(BaseLearner):
         """
         Train one incremental task
         """
-        self._cur_task += 1
+        # self._cur_task += 1
         task_size = data_manager.get_task_size(self._cur_task)
         self._total_classes = self._known_classes + task_size
 
         # update classifier head
-        self._network.update_fc(self._total_classes)
+        current_task_size = data_manager.get_task_size(self._cur_task)
+        self._network.update_fc(current_task_size)
 
         logging.info(
             f"Task {self._cur_task}: classes "
@@ -178,6 +179,8 @@ class InfLoRA(BaseLearner):
             print("Warning: No tasks initialized yet. Updating classifier for first task...")
             # 更新分类器以初始化第一个任务
             self._network.update_fc(self._total_classes)
+
+        print(f"Before training: numtask={self._network.numtask}, classifier_pool length={len(self._network.classifier_pool)}")
             
         for epoch in range(self.epochs):
             total_loss = 0.0
@@ -369,13 +372,13 @@ class InfLoRA(BaseLearner):
         return cnn_accy, cnn_accy_with_task, nme_accy, cnn_accy_task
 
     def _compute_accuracy(self):
-        """计算实际准确率"""
         self._network.eval()
-        vectors, targets = [], []
+        all_preds, all_targets = [], []
         
         with jt.no_grad():
             for i, data in enumerate(self.test_loader):
-                # 处理输入数据
+                if i >= 10:  # 限制批次以加快调试
+                    break
                 if len(data) == 3:
                     _, inputs, labels = data
                 elif len(data) == 2:
@@ -383,74 +386,47 @@ class InfLoRA(BaseLearner):
                 else:
                     continue
                 
-                # 确保输入是 Jittor Var
+                # 类型与维度处理
                 if not isinstance(inputs, jt.Var):
                     inputs = jt.array(inputs)
                 if not isinstance(labels, jt.Var):
                     labels = jt.array(labels, dtype=jt.int64)
-                
-                # 确保图像维度正确 (B, C, H, W)
                 if len(inputs.shape) == 4 and inputs.shape[-1] == 3:
                     inputs = inputs.permute(0, 3, 1, 2)
                 
-                # 前向传播 - 使用 interface 方法进行测试
-                outputs = self._network.interface(inputs)
+                logits = self._network.interface(inputs)
                 
-                # 处理输出
-                if isinstance(outputs, tuple):
-                    # 如果是元组，取第一个元素（logits）
-                    logits = outputs[0] if len(outputs) > 0 else None
-                elif isinstance(outputs, dict):
-                    # 如果是字典，取 'logits' 键
-                    logits = outputs.get('logits')
-                else:
-                    # 否则假定 outputs 本身就是 logits
-                    logits = outputs
+                # 确保 logits 不是元组
+                if isinstance(logits, tuple):
+                    logits = logits[0]
                 
-                # 获取预测结果
                 if logits is not None and hasattr(logits, 'argmax'):
-                    preds = logits.argmax(dim=1)
-                    # 确保 preds 是扁平的一维数组
-                    if hasattr(preds, 'numpy'):
-                        preds_np = preds.numpy()
+                    argmax_result = logits.argmax(dim=1)
+                    if isinstance(argmax_result, tuple):
+                        preds = argmax_result[1]   # 索引在第二个位置
                     else:
-                        preds_np = np.array(preds)
+                        preds = argmax_result
+                    # 转换为一维列表
+                    preds_np = preds.numpy().flatten().tolist()
+                    labels_np = labels.numpy().flatten().tolist()
                     
-                    # 展平预测结果
-                    preds_flat = preds_np.flatten()
-                    vectors.extend(preds_flat.tolist())
-                else:
-                    # 如果没有 logits，使用随机预测（仅用于测试）
-                    batch_size = inputs.shape[0]
-                    vectors.extend(np.random.randint(0, 10, batch_size).tolist())
-                
-                # 处理标签
-                if hasattr(labels, 'numpy'):
-                    labels_np = labels.numpy()
-                else:
-                    labels_np = np.array(labels)
-                
-                # 展平标签
-                labels_flat = labels_np.flatten()
-                targets.extend(labels_flat.tolist())
+                    # 检查长度一致
+                    assert len(preds_np) == len(labels_np), f"Batch {i}: preds {len(preds_np)} != labels {len(labels_np)}"
+                    
+                    all_preds.extend(preds_np)
+                    all_targets.extend(labels_np)
         
         self._network.train()
         
-        # 转换为 numpy 数组并确保是一维的
-        try:
-            vectors = np.array(vectors).flatten()
-            targets = np.array(targets).flatten()
-        except Exception as e:
-            print(f"Error converting arrays: {e}")
+        all_preds = np.array(all_preds)
+        all_targets = np.array(all_targets)
+        
+        if len(all_preds) != len(all_targets):
+            print(f"ERROR: Total preds {len(all_preds)} != targets {len(all_targets)}")
             return 0.0
         
-        # 计算准确率
-        if len(vectors) > 0 and len(targets) > 0 and len(vectors) == len(targets):
-            correct = (vectors == targets).sum()
-            total = len(targets)
-            accuracy = float(correct) / total * 100
-            print(f"Computed accuracy: {correct}/{total} = {accuracy:.2f}%")
-            return accuracy
-        else:
-            print(f"Warning: Shape mismatch - vectors: {len(vectors)}, targets: {len(targets)}")
-            return 0.0
+        correct = (all_preds == all_targets).sum()
+        total = len(all_targets)
+        accuracy = 100.0 * correct / total if total > 0 else 0.0
+        print(f"Overall test accuracy: {correct}/{total} = {accuracy:.2f}%")
+        return accuracy

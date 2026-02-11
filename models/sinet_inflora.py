@@ -336,17 +336,18 @@ class SiNet(nn.Module):
         self.total_sessions = total_sessions
         
         # 创建分类器池 (每个任务一个分类器)
-        self.classifier_pool = nn.ModuleList([
-            self._create_classifier(embd_dim, self.class_num)
-            for i in range(total_sessions)
-        ])
+        # self.classifier_pool = nn.ModuleList([
+        #     self._create_classifier(embd_dim, self.class_num)
+        #     for i in range(total_sessions)
+        # ])
 
-        # 创建备份分类器池
-        self.classifier_pool_backup = nn.ModuleList([
-            self._create_classifier(embd_dim, self.class_num)
-            for i in range(total_sessions)
-        ])
-
+        # # 创建备份分类器池
+        # self.classifier_pool_backup = nn.ModuleList([
+        #     self._create_classifier(embd_dim, self.class_num)
+        #     for i in range(total_sessions)
+        # ])
+        self.classifier_pool = nn.ModuleList()
+        self.classifier_pool_backup = nn.ModuleList()
         # 当前任务索引
         self.numtask = 0
     
@@ -402,7 +403,7 @@ class SiNet(nn.Module):
             return jt.concat(fc_outs, dim=1)
 
         # 确保有分类器可用
-        if self.numtask <= 0:
+        if self.numtask <= 0 or len(self.classifier_pool) == 0:
             print(f"Warning: numtask={self.numtask}, no classifier available")
             # 返回一个默认的输出
             batch_size = image.shape[0]
@@ -413,20 +414,7 @@ class SiNet(nn.Module):
             }
         
         # 确保索引有效
-        task_idx = self.numtask - 1
-        if task_idx < 0 or task_idx >= len(self.classifier_pool):
-            print(f"Warning: Invalid task index {task_idx}, classifier_pool length: {len(self.classifier_pool)}")
-            # 使用第一个分类器或创建一个临时的
-            if len(self.classifier_pool) > 0:
-                task_idx = 0
-            else:
-                # 创建一个临时分类器
-                batch_size = image.shape[0]
-                return {
-                    'logits': jt.zeros((batch_size, self.class_num)),
-                    'features': jt.zeros((batch_size, self.embd_dim)),
-                    'prompt_loss': jt.zeros((1,))
-                }
+        task_idx = min(self.numtask - 1, len(self.classifier_pool) - 1)
         
         image_features, prompt_loss = self.image_encoder(
             image, 
@@ -437,13 +425,13 @@ class SiNet(nn.Module):
         image_features = image_features[:, 0, :]  # 取 cls token 的特征
         image_features = image_features.view(image_features.shape[0], -1)
         
-        # 使用当前任务的分类器
-        logits = []
-        for prompts in [self.classifier_pool[task_idx]]:
-            logits.append(prompts(image_features))
-
+        classifier = self.classifier_pool[task_idx]
+        out = classifier(image_features)
+        if isinstance(out, tuple):
+            out = out[0]
+        
         return {
-            'logits': jt.concat(logits, dim=1),
+            'logits': out,
             'features': image_features,
             'prompt_loss': prompt_loss
         }
@@ -463,27 +451,30 @@ class SiNet(nn.Module):
         # 确保图像维度正确
         if len(image.shape) == 4 and image.shape[-1] == 3:
             image = image.permute(0, 3, 1, 2)
+            print(f"interface: permuted image shape: {image.shape}")
         
         image_features, _ = self.image_encoder(image, task_id=task_id)
         image_features = image_features[:, 0, :]
         image_features = image_features.view(image_features.shape[0], -1)
 
-        logits = []
-        # 确保有分类器可用
-        if len(self.classifier_pool) > 0:
-            for prompt in self.classifier_pool[:self.numtask]:
-                logits.append(prompt(image_features))
+        print(f"interface: image_features shape: {image_features.shape}")
+        print(f"interface: numtask={self.numtask}, classifier_pool length={len(self.classifier_pool)}")
         
-        # 确保返回的是二维张量 [batch_size, num_classes]
-        if len(logits) > 0:
-            result = jt.concat(logits, dim=1)
-            return result
-        else:
-            print("interface: no logits available")
-            # 返回一个零张量
+        # 收集所有已学任务的 logits
+        logits_list = []
+        for i in range(min(self.numtask, len(self.classifier_pool))):
+            out = self.classifier_pool[i](image_features)
+            # 防止 Jittor 返回元组
+            if isinstance(out, tuple):
+                out = out[0]
+            logits_list.append(out)
+        
+        if len(logits_list) == 0:
             batch_size = image.shape[0]
-            num_classes = self.class_num if hasattr(self, 'class_num') else 10
-            return jt.zeros((batch_size, num_classes))
+            return jt.zeros((batch_size, self.class_num))
+        
+        all_logits = jt.concat(logits_list, dim=1)
+        return all_logits
     
     def interface1(self, image, task_ids):
         logits = []
@@ -507,7 +498,23 @@ class SiNet(nn.Module):
         return jt.concat(logits, dim=1)
 
     def update_fc(self, nb_classes):
+        """
+        nb_classes: 当前任务的类别数（不是总类别数）
+        """
         self.numtask += 1
+        print(f"Update fc: numtask={self.numtask}, nb_classes={nb_classes}")
+        
+        # 确保分类器池长度至少等于当前任务索引+1
+        while len(self.classifier_pool) < self.numtask:
+            new_head = self._create_classifier(self.embd_dim, nb_classes)
+            self.classifier_pool.append(new_head)
+            # 同步备份池
+            new_head_backup = self._create_classifier(self.embd_dim, nb_classes)
+            self.classifier_pool_backup.append(new_head_backup)
+            print(f"Added classifier for task {len(self.classifier_pool)-1}, pool length: {len(self.classifier_pool)}")
+        
+        # 备份当前任务的分类器
+        self.classifier_backup(self.numtask - 1)
 
     def classifier_backup(self, task_id):
         """备份指定任务的分类器"""
