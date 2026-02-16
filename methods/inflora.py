@@ -97,6 +97,8 @@ class InfLoRA(BaseLearner):
         task_size = data_manager.get_task_size(self._cur_task)
         self._total_classes = self._known_classes + task_size
 
+        logging.info(f"[DEBUG] Task {self._cur_task}: known_classes={self._known_classes}, task_size={task_size}, total_classes={self._total_classes}")
+        logging.info(f"[DEBUG] Before update_fc: numtask={self._network.numtask}, classifier_pool length={len(self._network.classifier_pool)}")
         # update classifier head
         current_task_size = data_manager.get_task_size(self._cur_task)
         self._network.update_fc(current_task_size)
@@ -105,7 +107,7 @@ class InfLoRA(BaseLearner):
             f"Task {self._cur_task}: classes "
             f"{self._known_classes} → {self._total_classes}"
         )
-
+        logging.info(f"[DEBUG] After update_fc: numtask={self._network.numtask}, classifier_pool length={len(self._network.classifier_pool)}")
         train_dataset = data_manager.get_dataset(
             np.arange(self._known_classes, self._total_classes),
             source="train", mode="train"
@@ -181,9 +183,17 @@ class InfLoRA(BaseLearner):
             self._network.update_fc(self._total_classes)
 
         print(f"Before training: numtask={self._network.numtask}, classifier_pool length={len(self._network.classifier_pool)}")
-            
+
+        current_task_idx = self._network.numtask - 1
+        if current_task_idx >= 0 and current_task_idx < len(self._network.classifier_pool):
+            classifier_out_dim = self._network.classifier_pool[current_task_idx].out_features
+            logging.info(f"[DEBUG] Current task classifier output dim: {classifier_out_dim}")
+            logging.info(f"[DEBUG] Expected local label range: 0~{classifier_out_dim-1}")  
+        
         for epoch in range(self.epochs):
             total_loss = 0.0
+            correct=0
+            total=0
 
             for _, imgs, targets in self.train_loader:
                 # 确保输入是 Jittor Var
@@ -209,17 +219,45 @@ class InfLoRA(BaseLearner):
                 else:
                     logits = outputs
 
-                if logits is not None:
-                    loss = nn.cross_entropy_loss(logits, targets)
-                    optimizer.step(loss)
-                    total_loss += loss.item()
-                else:
-                    print("Warning: No logits returned from network")
+                if logits is None:
+                    continue
 
-            print(
+                mask = (targets >= self._known_classes) & (targets < self._total_classes)
+                if mask.sum() == 0:
+                    # 如果 batch 中没有当前任务样本，则跳过
+                    continue
+
+                current_logits = logits[mask]
+                current_targets = targets[mask]
+                # 将全局标签转换为局部标签（0 到 task_size-1）
+                local_targets = current_targets - self._known_classes
+                # ---------------------------------------------------------
+                print(f"  [DEBUG] current_logits mean: {current_logits.mean().item():.4f}, std: {current_logits.std().item():.4f}")
+                print(f"  [DEBUG] current_logits max: {current_logits.max().item():.4f}, min: {current_logits.min().item():.4f}")
+                preds_train = current_logits.argmax(dim=1)
+                if isinstance(preds_train, tuple):
+                    preds_train = preds_train[1]
+                print(f"  [DEBUG] preds distribution: {np.unique(preds_train.numpy(), return_counts=True)}")
+                # 计算 loss
+                loss = nn.cross_entropy_loss(current_logits, local_targets)
+                optimizer.step(loss)
+                
+                total_loss += loss.item()
+
+                # 计算训练准确率（可选）
+                preds = current_logits.argmax(dim=1)
+                if isinstance(preds, tuple):
+                    preds = preds[1]
+                preds = preds.int()
+                correct += (preds == local_targets).sum().item()
+                total += len(local_targets)
+
+            epoch_acc = 100.0 * correct / total if total > 0 else 0.0
+            logging.info(
                 f"[Task {self._cur_task}] "
                 f"Epoch {epoch+1}/{self.epochs}, "
-                f"Loss={total_loss:.3f}"
+                f"Loss={total_loss:.3f}, "
+                f"Accuracy={epoch_acc:.2f}%"
             )
 
         # ----------------------------------------------------
@@ -400,12 +438,17 @@ class InfLoRA(BaseLearner):
                 if isinstance(logits, tuple):
                     logits = logits[0]
                 
+                logging.info(f"  [Test] logits shape: {logits.shape}, labels shape: {labels.shape}")
+                logging.info(f"  [Test] labels min: {labels.min().item()}, max: {labels.max().item()}")
+                
                 if logits is not None and hasattr(logits, 'argmax'):
                     argmax_result = logits.argmax(dim=1)
                     if isinstance(argmax_result, tuple):
                         preds = argmax_result[1]   # 索引在第二个位置
                     else:
                         preds = argmax_result
+                    
+                    logging.info(f"  [Test] preds unique values: {np.unique(preds.numpy())}")
                     # 转换为一维列表
                     preds_np = preds.numpy().flatten().tolist()
                     labels_np = labels.numpy().flatten().tolist()
