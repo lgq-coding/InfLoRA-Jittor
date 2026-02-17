@@ -67,7 +67,7 @@ class InfLoRA(BaseLearner):
         self.epochs = args["epochs"]
         self.lrate = args["lrate"]
         self.batch_size = args["batch_size"]
-
+        self.data_manager=None
         # ----------------------------------------------------
         # InfLoRA / DualGPM
         # ----------------------------------------------------
@@ -93,32 +93,40 @@ class InfLoRA(BaseLearner):
         """
         Train one incremental task
         """
-        # self._cur_task += 1
+        self.data_manager=data_manager
+        # 手动管理任务索引
+        if not hasattr(self, '_cur_task') or self._cur_task < 0:
+            self._cur_task = 0
+        else:
+            self._cur_task += 1
+
+        # 获取当前任务的类别数
         task_size = data_manager.get_task_size(self._cur_task)
         self._total_classes = self._known_classes + task_size
 
         logging.info(f"[DEBUG] Task {self._cur_task}: known_classes={self._known_classes}, task_size={task_size}, total_classes={self._total_classes}")
         logging.info(f"[DEBUG] Before update_fc: numtask={self._network.numtask}, classifier_pool length={len(self._network.classifier_pool)}")
         # update classifier head
-        current_task_size = data_manager.get_task_size(self._cur_task)
-        self._network.update_fc(current_task_size)
+        # current_task_size = data_manager.get_task_size(self._cur_task)
+        self._network.update_fc(task_size)
 
         logging.info(
             f"Task {self._cur_task}: classes "
             f"{self._known_classes} → {self._total_classes}"
         )
         logging.info(f"[DEBUG] After update_fc: numtask={self._network.numtask}, classifier_pool length={len(self._network.classifier_pool)}")
-        train_dataset = data_manager.get_dataset(
-            np.arange(self._known_classes, self._total_classes),
+        train_indices = list(range(self._known_classes, self._total_classes))
+        train_dataset = self.data_manager.get_dataset(
+            indices=train_indices,
             source="train", mode="train"
         )
-        test_dataset = data_manager.get_dataset(
-            np.arange(0, self._total_classes),
-            source="test", mode="test"
-        )
-
-        self.train_loader = train_dataset
-        self.test_loader = test_dataset
+        # test_dataset = data_manager.get_dataset(
+        #     np.arange(0, self._total_classes),
+        #     source="test", mode="test"
+        # )
+        from jittor.dataset import DataLoader
+        self.train_loader = DataLoader(train_dataset, batch_size=self.args['batch_size'], shuffle=True, num_workers=0)
+        # self.test_loader = test_dataset
 
         self._train()
         self.clustering(self.train_loader)
@@ -187,9 +195,9 @@ class InfLoRA(BaseLearner):
         current_task_idx = self._network.numtask - 1
         if current_task_idx >= 0 and current_task_idx < len(self._network.classifier_pool):
             classifier_out_dim = self._network.classifier_pool[current_task_idx].out_features
-            logging.info(f"[DEBUG] Current task classifier output dim: {classifier_out_dim}")
-            logging.info(f"[DEBUG] Expected local label range: 0~{classifier_out_dim-1}")  
-        
+            # logging.info(f"[DEBUG] Current task classifier output dim: {classifier_out_dim}")
+            # logging.info(f"[DEBUG] Expected local label range: 0~{classifier_out_dim-1}")  
+        task_index=self._known_classes // 10
         for epoch in range(self.epochs):
             total_loss = 0.0
             correct=0
@@ -226,7 +234,7 @@ class InfLoRA(BaseLearner):
                 if mask.sum() == 0:
                     # 如果 batch 中没有当前任务样本，则跳过
                     continue
-
+                
                 current_logits = logits[mask]
                 current_targets = targets[mask]
                 # 将全局标签转换为局部标签（0 到 task_size-1）
@@ -254,7 +262,7 @@ class InfLoRA(BaseLearner):
 
             epoch_acc = 100.0 * correct / total if total > 0 else 0.0
             logging.info(
-                f"[Task {self._cur_task}] "
+                f"[Task {task_index}] "
                 f"Epoch {epoch+1}/{self.epochs}, "
                 f"Loss={total_loss:.3f}, "
                 f"Accuracy={epoch_acc:.2f}%"
@@ -411,12 +419,17 @@ class InfLoRA(BaseLearner):
 
     def _compute_accuracy(self):
         self._network.eval()
+        test_indices = list(range(self._total_classes))
+        test_dataset = self.data_manager.get_dataset(indices=test_indices, source='test', mode='test')
+        from jittor.dataset import DataLoader
+        test_loader = DataLoader(test_dataset, batch_size=self.args['batch_size'], shuffle=False, num_workers=0)
+
         all_preds, all_targets = [], []
-        
+            
         with jt.no_grad():
-            for i, data in enumerate(self.test_loader):
-                if i >= 10:  # 限制批次以加快调试
-                    break
+            for i, data in enumerate(test_loader):
+                # if i >= 10:  # 限制批次以加快调试
+                #     break
                 if len(data) == 3:
                     _, inputs, labels = data
                 elif len(data) == 2:
@@ -438,8 +451,8 @@ class InfLoRA(BaseLearner):
                 if isinstance(logits, tuple):
                     logits = logits[0]
                 
-                logging.info(f"  [Test] logits shape: {logits.shape}, labels shape: {labels.shape}")
-                logging.info(f"  [Test] labels min: {labels.min().item()}, max: {labels.max().item()}")
+                # logging.info(f"  [Test] logits shape: {logits.shape}, labels shape: {labels.shape}")
+                # logging.info(f"  [Test] labels min: {labels.min().item()}, max: {labels.max().item()}")
                 
                 if logits is not None and hasattr(logits, 'argmax'):
                     argmax_result = logits.argmax(dim=1)
@@ -448,7 +461,7 @@ class InfLoRA(BaseLearner):
                     else:
                         preds = argmax_result
                     
-                    logging.info(f"  [Test] preds unique values: {np.unique(preds.numpy())}")
+                    # logging.info(f"  [Test] preds unique values: {np.unique(preds.numpy())}")
                     # 转换为一维列表
                     preds_np = preds.numpy().flatten().tolist()
                     labels_np = labels.numpy().flatten().tolist()
@@ -463,13 +476,14 @@ class InfLoRA(BaseLearner):
         
         all_preds = np.array(all_preds)
         all_targets = np.array(all_targets)
-        
+        # 转换为整型后再比较
+        all_preds = all_preds.astype(int)
+        all_targets = all_targets.astype(int)
         if len(all_preds) != len(all_targets):
             print(f"ERROR: Total preds {len(all_preds)} != targets {len(all_targets)}")
             return 0.0
-        
         correct = (all_preds == all_targets).sum()
         total = len(all_targets)
         accuracy = 100.0 * correct / total if total > 0 else 0.0
-        print(f"Overall test accuracy: {correct}/{total} = {accuracy:.2f}%")
+        logging.info(f"Overall test accuracy: {correct}/{total} = {accuracy:.2f}%")
         return accuracy
