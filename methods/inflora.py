@@ -28,6 +28,7 @@ def freeze(param):
     """Freeze parameter (stop gradient)"""
     # [JT-CHANGE] torch.requires_grad = False → stop_grad()
     param.stop_grad()
+    
 
 def unfreeze(param):
     """Unfreeze parameter (enable gradient)"""
@@ -150,6 +151,7 @@ class InfLoRA(BaseLearner):
         # 1. Freeze everything
         # ----------------------------------------------------
         for p in self._network.parameters():
+            print("freeze p!")
             freeze(p)
 
         # ----------------------------------------------------
@@ -158,7 +160,7 @@ class InfLoRA(BaseLearner):
         for module in self._network.modules():
             if isinstance(module, Attention_LoRA):
                 t = self._cur_task
-
+                print(f"Unfreezing LoRA A for task {t} in module {module}")
                 # [InfLoRA CORE]
                 # Only A is trainable, B is frozen
                 unfreeze(module.lora_A_k[t].weight)
@@ -169,6 +171,7 @@ class InfLoRA(BaseLearner):
         # ----------------------------------------------------
         for name, p in self._network.named_parameters():
             if "classifier_pool" in name:
+                print(f"Unfreezing classifier parameter: {name}")
                 unfreeze(p)
 
         # ----------------------------------------------------
@@ -177,11 +180,17 @@ class InfLoRA(BaseLearner):
         # [JT-CHANGE]
         # Jittor optimizer sees all params,
         # but gradient flow is controlled by stop_grad()
-        optimizer = optim.Adam(
+        optimizer = optim.AdamW(
             self._network.parameters(),
-            lr=self.lrate
+            lr=self.lrate,
+            weight_decay=0.01
+            # momentum=0.9,
+            # weight_decay=5e-4
         )
-
+        print("Trainable parameters after unfreeze:")
+        for name, p in self._network.named_parameters():
+            if not p.is_stop_grad():
+                print(f"  {name} is trainable")
         # ----------------------------------------------------
         # 5. Training loop
         # ----------------------------------------------------
@@ -202,8 +211,8 @@ class InfLoRA(BaseLearner):
             total_loss = 0.0
             correct=0
             total=0
-
-            for _, imgs, targets in self.train_loader:
+            
+            for batch_idx, (_, imgs, targets) in enumerate(self.train_loader):
                 # 确保输入是 Jittor Var
                 if not isinstance(imgs, jt.Var):
                     imgs = jt.array(imgs)
@@ -214,8 +223,14 @@ class InfLoRA(BaseLearner):
                 if len(imgs.shape) == 4 and imgs.shape[-1] <= 3:
                     # BHWC 格式，转换为 BCHW
                     imgs = imgs.permute(0, 3, 1, 2)
-                
-                print(f"Training batch - imgs shape: {imgs.shape}, numtask: {self._network.numtask}")
+                if epoch == 0:
+                    with jt.no_grad():
+                        sample_imgs = imgs[:4]  # 取 4 张图
+                        feat, _ = self._network.image_encoder(sample_imgs, task_id=0)
+                        # print(f"[Backbone] feature shape: {feat.shape}")
+                        # print(f"[Backbone] feature mean: {feat.mean().item():.4f}, std: {feat.std().item():.4f}")
+                        # print(f"[Backbone] feature min: {feat.min().item():.4f}, max: {feat.max().item():.4f}")
+                # print(f"Training batch - imgs shape: {imgs.shape}, numtask: {self._network.numtask}")
                 
                 outputs = self._network(imgs)
                 
@@ -229,7 +244,10 @@ class InfLoRA(BaseLearner):
 
                 if logits is None:
                     continue
-
+                if batch_idx == 0 and epoch == 0:
+                    targets_np = targets.numpy().flatten()
+                    unique_targets, counts = np.unique(targets_np, return_counts=True)
+                    logging.info(f"[Data] Batch targets: {dict(zip(unique_targets, counts))}")
                 mask = (targets >= self._known_classes) & (targets < self._total_classes)
                 if mask.sum() == 0:
                     # 如果 batch 中没有当前任务样本，则跳过
@@ -239,24 +257,59 @@ class InfLoRA(BaseLearner):
                 current_targets = targets[mask]
                 # 将全局标签转换为局部标签（0 到 task_size-1）
                 local_targets = current_targets - self._known_classes
-                # ---------------------------------------------------------
-                print(f"  [DEBUG] current_logits mean: {current_logits.mean().item():.4f}, std: {current_logits.std().item():.4f}")
-                print(f"  [DEBUG] current_logits max: {current_logits.max().item():.4f}, min: {current_logits.min().item():.4f}")
+                # local_targets=local_targets.int()  # 确保是整数类型
+                if batch_idx == 0 and epoch == 0:
+                    logging.info(f"[Mask] mask sum: {mask.sum().item()}, known_classes={self._known_classes}, total_classes={self._total_classes}")
+                    logging.info(f"[Targets] current_targets range: {current_targets.min().item()}~{current_targets.max().item()}")
+                    logging.info(f"[Local] local_targets range: {local_targets.min().item()}~{local_targets.max().item()}")
+                    logging.info(f"[Logits] current_logits shape: {current_logits.shape}, mean={current_logits.mean().item():.2f}, std={current_logits.std().item():.2f}")
+                    # ---------------------------------------------------------
+                    logging.info(f"  [DEBUG] current_logits mean: {current_logits.mean().item():.4f}, std: {current_logits.std().item():.4f}")
+                    logging.info(f"  [DEBUG] current_logits max: {current_logits.max().item():.4f}, min: {current_logits.min().item():.4f}")
                 preds_train = current_logits.argmax(dim=1)
                 if isinstance(preds_train, tuple):
-                    preds_train = preds_train[1]
-                print(f"  [DEBUG] preds distribution: {np.unique(preds_train.numpy(), return_counts=True)}")
+                    preds_train = preds_train[0]
+                if batch_idx == 0 and epoch == 0:
+                    logging.info(f"  [DEBUG] preds distribution: {np.unique(preds_train.numpy(), return_counts=True)}")
                 # 计算 loss
                 loss = nn.cross_entropy_loss(current_logits, local_targets)
                 optimizer.step(loss)
-                
+                if batch_idx == 0 and epoch == 0:
+                    logging.info(f"  [DEBUG] current_logits mean: {current_logits.mean().item():.4f}, std: {current_logits.std().item():.4f}")
+                    logging.info(f"  [DEBUG] current_logits max: {current_logits.max().item():.4f}, min: {current_logits.min().item():.4f}")
+                # total_norm = 0.0
+                # 放在 optimizer.step(loss) 之后
+                # if batch_idx % 10 == 0:
+                #     total_norm = 0.0
+                    # logging.info(f"\n[Grad Debug] Batch {batch_idx}:")
+                    # for name, p in self._network.named_parameters():
+                    #     grad = p.opt_grad(optimizer)
+                    #     if grad is not None:
+                    #         # 计算梯度的全局范数（先 norm 再 sum 确保标量）
+                    #         grad_norm = grad.norm().sum().item()
+                    #         total_norm += grad_norm ** 2
+                    #         if grad_norm > 1e-6:
+                                # logging.info(f"  grad {name}: {grad_norm:.6f}")
+                        # else:
+                            # logging.info(f"  {name} has no grad")
+                    
+                    # total_norm = total_norm ** 0.5
+                    # logging.info(f"  total grad norm: {total_norm:.6f}")
+                    # 打印分类器权重范数
+                    # w = self._network.classifier_pool[self._cur_task].weight
+                    # logging.info(f"  classifier weight norm: {w.norm().sum().item():.6f}")
                 total_loss += loss.item()
-
-                # 计算训练准确率（可选）
+                log_softmax = current_logits - current_logits.logsumexp(dim=1, keepdims=True)
+                nll = -log_softmax[jt.arange(len(local_targets)), local_targets]
+                manual_loss = nll.mean()
+                
                 preds = current_logits.argmax(dim=1)
                 if isinstance(preds, tuple):
-                    preds = preds[1]
+                    preds = preds[0]
+                # print(preds)
                 preds = preds.int()
+                # preds*=10
+                # print(preds)
                 correct += (preds == local_targets).sum().item()
                 total += len(local_targets)
 
@@ -264,8 +317,9 @@ class InfLoRA(BaseLearner):
             logging.info(
                 f"[Task {task_index}] "
                 f"Epoch {epoch+1}/{self.epochs}, "
-                f"Loss={total_loss:.3f}, "
-                f"Accuracy={epoch_acc:.2f}%"
+                # f"Loss={total_loss:.3f}, "
+                f"[Loss] loss: {manual_loss.item():.4f} "
+                f"Accuracy={epoch_acc:.4f}%"
             )
 
         # ----------------------------------------------------
@@ -457,7 +511,7 @@ class InfLoRA(BaseLearner):
                 if logits is not None and hasattr(logits, 'argmax'):
                     argmax_result = logits.argmax(dim=1)
                     if isinstance(argmax_result, tuple):
-                        preds = argmax_result[1]   # 索引在第二个位置
+                        preds = argmax_result[0]   # 索引在第二个位置
                     else:
                         preds = argmax_result
                     

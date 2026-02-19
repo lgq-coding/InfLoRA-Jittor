@@ -358,7 +358,7 @@ class SiNet(nn.Module):
     
     def load_pretrained_weights(self, pth_path):
         """
-        从 HuggingFace google/vit-base-patch16-224-in21k 权重加载到 Jittor 模型
+        从 google/vit-base-patch16-224-in21k 权重加载到 Jittor 模型
         """
         try:
             import torch
@@ -414,12 +414,18 @@ class SiNet(nn.Module):
 
             # ---- 4. final norm (layernorm) ----
             # HuggingFace 中 final norm 通常是 'embeddings.LayerNorm.weight'
-            norm_w_key = 'embeddings.LayerNorm.weight'
-            norm_b_key = 'embeddings.LayerNorm.bias'
-            if norm_w_key in state and norm_b_key in state:
-                vit.norm.weight = jt.array(state[norm_w_key].numpy())
-                vit.norm.bias   = jt.array(state[norm_b_key].numpy())
-                print("  [✓] final norm")
+            final_norm_weight_key = None
+            final_norm_bias_key = None
+            for k in state.keys():
+                if k == 'layernorm.weight':
+                    final_norm_weight_key = k
+                elif k == 'layernorm.bias':
+                    final_norm_bias_key = k
+
+            if final_norm_weight_key and final_norm_bias_key:
+                vit.norm.weight = jt.array(state[final_norm_weight_key].numpy())
+                vit.norm.bias   = jt.array(state[final_norm_bias_key].numpy())
+                print("  [✓] final norm loaded")
             else:
                 print("  [⚠] final norm not found, will remain random (may affect accuracy)")
 
@@ -521,8 +527,9 @@ class SiNet(nn.Module):
         
         # 初始化权重
         # 使用 Jittor 的 kaiming_uniform_ 初始化
-        jt.init.kaiming_uniform_(head.weight, a=math.sqrt(5))
-        
+        # jt.init.kaiming_uniform_(head.weight, a=math.sqrt(5))
+        jt.init.gauss_(head.weight, mean=0.0, std=2.0)
+
         if head.bias is not None:
             # 偏置初始化为0，而不是均匀分布
             jt.init.constant_(head.bias, 0)
@@ -543,13 +550,13 @@ class SiNet(nn.Module):
         return image_features
 
     def execute(self, image, get_feat=False, get_cur_feat=False, fc_only=False):
-        print(f"SiNet execute input shape: {image.shape}")
+        # print(f"SiNet execute input shape: {image.shape}")
         
         # 在进入 image_encoder 之前，先确保图像维度正确
         if len(image.shape) == 4 and image.shape[-1] == 3:
             # BHWC 转换为 BCHW
             image = image.permute(0, 3, 1, 2)
-            print(f"Permuted image shape: {image.shape}")
+            # print(f"Permuted image shape: {image.shape}")
         
         if fc_only:
             fc_outs = []
@@ -616,14 +623,14 @@ class SiNet(nn.Module):
         # 确保图像维度正确
         if len(image.shape) == 4 and image.shape[-1] == 3:
             image = image.permute(0, 3, 1, 2)
-            print(f"interface: permuted image shape: {image.shape}")
+            # print(f"interface: permuted image shape: {image.shape}")
         
         image_features, _ = self.image_encoder(image, task_id=task_id)
         image_features = image_features[:, 0, :]
         image_features = image_features.view(image_features.shape[0], -1)
 
-        print(f"interface: image_features shape: {image_features.shape}")
-        print(f"interface: numtask={self.numtask}, classifier_pool length={len(self.classifier_pool)}")
+        # print(f"interface: image_features shape: {image_features.shape}")
+        # print(f"interface: numtask={self.numtask}, classifier_pool length={len(self.classifier_pool)}")
         
         # 收集所有已学任务的 logits
         logits_list = []
