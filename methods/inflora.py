@@ -15,8 +15,7 @@ from jittor import optim
 from sklearn.cluster import KMeans
 
 from .base import BaseLearner
-from models.sinet_inflora import SiNet
-from models.vit_inflora import Attention_LoRA
+from models.sinet_inflora import SiNet,Attention_LoRA
 from utils.toolkit import accuracy
 
 
@@ -151,7 +150,7 @@ class InfLoRA(BaseLearner):
         # 1. Freeze everything
         # ----------------------------------------------------
         for p in self._network.parameters():
-            print("freeze p!")
+            # print("freeze p!")
             freeze(p)
 
         # ----------------------------------------------------
@@ -163,8 +162,53 @@ class InfLoRA(BaseLearner):
                 print(f"Unfreezing LoRA A for task {t} in module {module}")
                 # [InfLoRA CORE]
                 # Only A is trainable, B is frozen
-                unfreeze(module.lora_A_k[t].weight)
-                unfreeze(module.lora_A_v[t].weight)
+                while len(module.lora_A_q) <= t:
+                    # 动态添加新的 LoRA 参数（根据当前 rank 和 embed_dim）
+                    new_A = nn.Linear(module.embed_dim, module.rank, bias=False)
+                    new_B = nn.Linear(module.rank, module.embed_dim, bias=False)
+                    jt.init.gauss_(new_A.weight, 0.0, 0.02)
+                    jt.init.constant_(new_B.weight, 0)
+                    module.lora_A_q.append(new_A)
+                    module.lora_B_q.append(new_B)
+                while len(module.lora_A_k) <= t:
+                    new_A = nn.Linear(module.embed_dim, module.rank, bias=False)
+                    new_B = nn.Linear(module.rank, module.embed_dim, bias=False)
+                    jt.init.gauss_(new_A.weight, 0.0, 0.02)
+                    jt.init.constant_(new_B.weight, 0)
+                    module.lora_A_k.append(new_A)
+                    module.lora_B_k.append(new_B)
+                while len(module.lora_A_v) <= t:
+                    new_A = nn.Linear(module.embed_dim, module.rank, bias=False)
+                    new_B = nn.Linear(module.rank, module.embed_dim, bias=False)
+                    jt.init.gauss_(new_A.weight, 0.0, 0.02)
+                    jt.init.constant_(new_B.weight, 0)
+                    module.lora_A_v.append(new_A)
+                    module.lora_B_v.append(new_B)
+                while len(module.lora_A_o) <= t:
+                    new_A = nn.Linear(module.embed_dim, module.rank, bias=False)
+                    new_B = nn.Linear(module.rank, module.embed_dim, bias=False)
+                    jt.init.gauss_(new_A.weight, 0.0, 0.02)
+                    jt.init.constant_(new_B.weight, 0)
+                    module.lora_A_o.append(new_A)
+                    module.lora_B_o.append(new_B)
+
+
+                if t == 0:
+                    unfreeze(module.lora_A_q[t].weight)
+                    unfreeze(module.lora_B_q[t].weight)
+                    unfreeze(module.lora_A_k[t].weight)
+                    unfreeze(module.lora_B_k[t].weight)
+                    unfreeze(module.lora_A_v[t].weight)
+                    unfreeze(module.lora_B_v[t].weight)
+                    unfreeze(module.lora_A_o[t].weight)
+                    unfreeze(module.lora_B_o[t].weight)
+                else:
+                    # 后续任务：仅解冻A（组合系数），B保持冻结
+                    unfreeze(module.lora_A_q[t].weight)
+                    unfreeze(module.lora_A_k[t].weight)
+                    unfreeze(module.lora_A_v[t].weight)
+                    unfreeze(module.lora_A_o[t].weight)
+                    # B不解冻，保持为基础子空间
 
         # ----------------------------------------------------
         # 3. Enable classifier head
@@ -174,6 +218,8 @@ class InfLoRA(BaseLearner):
                 print(f"Unfreezing classifier parameter: {name}")
                 unfreeze(p)
 
+        # if self._cur_task > 0:
+        #     self._apply_orthogonal_constraints()
         # ----------------------------------------------------
         # 4. Optimizer
         # ----------------------------------------------------
@@ -354,6 +400,31 @@ class InfLoRA(BaseLearner):
         # store task keys
         self.all_keys.append(jt.array(km.cluster_centers_))
 
+
+    def _apply_orthogonal_constraints(self):
+        """
+        为后续任务添加梯度钩子，确保新任务的梯度与旧任务的基础子空间正交
+        这是InfLoRA消除干扰的核心机制
+        """
+        def make_grad_hook(basis):
+            def hook(grad):
+                if grad is None or basis is None:
+                    return grad
+                # 将梯度投影到与基础子空间正交的方向
+                # proj = basis @ basis^T @ grad
+                proj = grad @ basis.T @ basis
+                return grad - proj  # 保留正交分量
+            return hook
+
+        for module in self._network.modules():
+            if isinstance(module, Attention_LoRA) and module.subspace_basis is not None:
+                basis = module.subspace_basis
+                # 为当前任务的A参数注册梯度钩子
+                t = self._cur_task
+                module.lora_A_q[t].weight.register_hook(make_grad_hook(basis))
+                module.lora_A_k[t].weight.register_hook(make_grad_hook(basis))
+                module.lora_A_v[t].weight.register_hook(make_grad_hook(basis))
+                module.lora_A_o[t].weight.register_hook(make_grad_hook(basis))
     # ========================================================
     # DualGPM (core continual-learning constraint)
     # ========================================================
@@ -370,49 +441,59 @@ class InfLoRA(BaseLearner):
             + self.lamb
         )
         print("DualGPM threshold:", threshold)
-
+        lora_layers = []
+        for module in self._network.modules():
+            if isinstance(module, Attention_LoRA):
+                lora_layers.append(module)
         # ----------------------------------------------------
         # First task
         # ----------------------------------------------------
         if len(self.feature_list) == 0:
-            for act in mat_list:
+            for i,act in enumerate(mat_list):
                 A = to_var(act)
 
                 # [JT-CHANGE] torch.linalg.svd → jt.linalg.svd
-                U, S, V = jt.linalg.svd(A, full_matrices=False)
+                U, S, V = jt.linalg.svd(A)
 
-                sval = (S ** 2).numpy()
+                sval = (S ** 2).data
                 ratio = sval / (sval.sum() + 1e-12)
 
                 r = int(np.sum(np.cumsum(ratio) < threshold))
                 r = max(r, 1)
 
-                self.feature_list.append(U[:, :r])
+                basis = U[:, :r]
+                self.feature_list.append(basis)
                 self.project_type.append("remove")
+                
+                # 将正交基存入对应的Attention层
+                if i < len(lora_layers):
+                    lora_layers[i].set_subspace_basis(basis)
             return
 
         # ----------------------------------------------------
         # Subsequent tasks
         # ----------------------------------------------------
         for i, act in enumerate(mat_list):
+            if i >= len(lora_layers):
+                continue
             A = to_var(act)
             F = self.feature_list[i]
 
             proj = F @ F.transpose() @ A
             A_hat = A - proj
 
-            U, S, V = jt.linalg.svd(A_hat, full_matrices=False)
+            U, S, V = jt.linalg.svd(A_hat)
 
-            sval = (S ** 2).numpy()
+            sval = (S ** 2).data
             ratio = sval / (sval.sum() + 1e-12)
-
             r = int(np.sum(np.cumsum(ratio) < threshold))
-            if r == 0:
-                continue
 
-            self.feature_list[i] = jt.concat(
-                [F, U[:, :r]], dim=1
-            )
+            if r > 0:
+                # 扩展正交基
+                new_basis = jt.concat([F, U[:, :r]], dim=1)
+                self.feature_list[i] = new_basis
+                lora_layers[i].set_subspace_basis(new_basis)
+
 
         # ----------------------------------------------------
         # Summary

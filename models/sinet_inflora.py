@@ -5,7 +5,121 @@ import jittor.nn as nn
 from jittor.attention import MultiheadAttention
 from copy import deepcopy
 
+# ===============================
+#   Attention with LoRA (InfLoRA核心)
+# ===============================
+class Attention_LoRA(nn.Module):
+    """
+    InfLoRA的核心注意力模块
+    包含原始qkv投影（冻结）+ 每任务的LoRA分支
+    """
+    def __init__(self, embed_dim, num_heads, qkv_bias=True, attn_drop=0., proj_drop=0.,
+                 rank=64, n_tasks=10):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.rank = rank
+        self.n_tasks = n_tasks
 
+        # ----- 原始预训练权重（冻结）-----
+        self.qkv = nn.Linear(embed_dim, embed_dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(embed_dim, embed_dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        # ----- LoRA参数（每个任务一套）-----
+        # InfLoRA核心：A是组合系数（可训练），B是基础子空间（第一个任务后冻结）
+        self.lora_A_q = nn.ModuleList()  # 组合系数
+        self.lora_B_q = nn.ModuleList()  # 基础子空间
+        self.lora_A_k = nn.ModuleList()
+        self.lora_B_k = nn.ModuleList()
+        self.lora_A_v = nn.ModuleList()
+        self.lora_B_v = nn.ModuleList()
+        self.lora_A_o = nn.ModuleList()
+        self.lora_B_o = nn.ModuleList()
+
+        for _ in range(n_tasks):
+            # 初始化LoRA参数：A随机初始化（组合系数），B初始化为0（基础子空间）
+            # 符合论文：微调A等价于在B定义的子空间内微调
+            A_q = nn.Linear(embed_dim, rank, bias=False)
+            B_q = nn.Linear(rank, embed_dim, bias=False)
+            jt.init.gauss_(A_q.weight, 0.0, 0.02)  # 随机初始化
+            jt.init.constant_(B_q.weight, 0)       # 初始化为0
+            self.lora_A_q.append(A_q)
+            self.lora_B_q.append(B_q)
+
+            A_k = nn.Linear(embed_dim, rank, bias=False)
+            B_k = nn.Linear(rank, embed_dim, bias=False)
+            jt.init.gauss_(A_k.weight, 0.0, 0.02)
+            jt.init.constant_(B_k.weight, 0)
+            self.lora_A_k.append(A_k)
+            self.lora_B_k.append(B_k)
+
+            A_v = nn.Linear(embed_dim, rank, bias=False)
+            B_v = nn.Linear(rank, embed_dim, bias=False)
+            jt.init.gauss_(A_v.weight, 0.0, 0.02)
+            jt.init.constant_(B_v.weight, 0)
+            self.lora_A_v.append(A_v)
+            self.lora_B_v.append(B_v)
+
+            A_o = nn.Linear(embed_dim, rank, bias=False)
+            B_o = nn.Linear(rank, embed_dim, bias=False)
+            jt.init.gauss_(A_o.weight, 0.0, 0.02)
+            jt.init.constant_(B_o.weight, 0)
+            self.lora_A_o.append(A_o)
+            self.lora_B_o.append(B_o)
+
+        # ----- 用于DualGPM的正交基存储 -----
+        self.subspace_basis = None  # 存储当前层的基础子空间（由B构成）
+        self.cur_matrix = None      # 存储激活，用于DualGPM计算
+
+    def execute(self, x, task_id):
+        """
+        前向传播：原始qkv + LoRA增量
+        """
+        B, N, C = x.shape
+
+        # 1. 原始qkv计算（冻结）
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # [B, num_heads, N, head_dim]
+
+        # 2. LoRA增量计算
+        # 注意：lora_A是组合系数，lora_B是基础子空间
+        lora_q = self.lora_B_q[task_id](self.lora_A_q[task_id](x))
+        lora_k = self.lora_B_k[task_id](self.lora_A_k[task_id](x))
+        lora_v = self.lora_B_v[task_id](self.lora_A_v[task_id](x))
+        lora_o = self.lora_B_o[task_id](self.lora_A_o[task_id](x))
+
+        # 重塑LoRA增量以匹配注意力维度
+        lora_q = lora_q.reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        lora_k = lora_k.reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        lora_v = lora_v.reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        # 3. 合并（原始 + LoRA）
+        q = q + lora_q
+        k = k + lora_k
+        v = v + lora_v
+
+        # 4. 注意力计算
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        # 5. 输出投影 + LoRA输出增量
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x) + lora_o
+        x = self.proj_drop(x)
+
+        # 6. 收集激活用于DualGPM（取平均池化作为该层的特征表示）
+        self.cur_matrix = x.mean(dim=1)  # [B, C]
+
+        return x
+
+    def set_subspace_basis(self, basis):
+        """设置正交基（由DualGPM计算得到）"""
+        self.subspace_basis = basis
 # ===============================
 #   Transformer Block 类 (Jittor 版本)
 # ===============================
@@ -22,8 +136,15 @@ class TransformerBlock(nn.Module):
         self.block_idx = block_idx
         
         # 自注意力层
-        self.attn = MultiheadAttention(embed_dim, num_heads, dropout=attn_drop_rate)
-        self.attn_drop = nn.Dropout(attn_drop_rate)
+        self.attn = Attention_LoRA(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            attn_drop=attn_drop_rate,
+            proj_drop=drop_rate,
+            rank=rank,
+            n_tasks=n_tasks
+        )
+        # self.attn_drop = nn.Dropout(attn_drop_rate)
         
         # MLP 层
         self.mlp = nn.Sequential(
@@ -42,28 +163,28 @@ class TransformerBlock(nn.Module):
         self.dropout = nn.Dropout(drop_rate)
         
         # 初始化 LoRA 参数
-        self._init_lora_params()
+        # self._init_lora_params()
     
-    def _init_lora_params(self):
-        """初始化 LoRA 参数"""
-        # LoRA 参数列表
-        self.lora_A_k = nn.ModuleList()
-        self.lora_B_k = nn.ModuleList()
-        self.lora_A_v = nn.ModuleList()
-        self.lora_B_v = nn.ModuleList()
+    # def _init_lora_params(self):
+    #     """初始化 LoRA 参数"""
+    #     # LoRA 参数列表
+    #     self.lora_A_k = nn.ModuleList()
+    #     self.lora_B_k = nn.ModuleList()
+    #     self.lora_A_v = nn.ModuleList()
+    #     self.lora_B_v = nn.ModuleList()
         
-        # 初始化 LoRA 参数
-        for _ in range(self.n_tasks):
-            self.lora_A_k.append(nn.Linear(self.embed_dim, self.rank, bias=False))
-            self.lora_B_k.append(nn.Linear(self.rank, self.embed_dim, bias=False))
-            self.lora_A_v.append(nn.Linear(self.embed_dim, self.rank, bias=False))
-            self.lora_B_v.append(nn.Linear(self.rank, self.embed_dim, bias=False))
+    #     # 初始化 LoRA 参数
+    #     for _ in range(self.n_tasks):
+    #         self.lora_A_k.append(nn.Linear(self.embed_dim, self.rank, bias=False))
+    #         self.lora_B_k.append(nn.Linear(self.rank, self.embed_dim, bias=False))
+    #         self.lora_A_v.append(nn.Linear(self.embed_dim, self.rank, bias=False))
+    #         self.lora_B_v.append(nn.Linear(self.rank, self.embed_dim, bias=False))
             
-            # 初始化 LoRA 参数为 0
-            jt.init.constant_(self.lora_A_k[-1].weight, 0)
-            jt.init.constant_(self.lora_B_k[-1].weight, 0)
-            jt.init.constant_(self.lora_A_v[-1].weight, 0)
-            jt.init.constant_(self.lora_B_v[-1].weight, 0)
+    #         # 初始化 LoRA 参数为 0
+    #         jt.init.constant_(self.lora_A_k[-1].weight, 0)
+    #         jt.init.constant_(self.lora_B_k[-1].weight, 0)
+    #         jt.init.constant_(self.lora_A_v[-1].weight, 0)
+    #         jt.init.constant_(self.lora_B_v[-1].weight, 0)
     
     def execute(self, x, task_id=0):
         """前向传播"""
@@ -73,11 +194,11 @@ class TransformerBlock(nn.Module):
         # 自注意力
         # 注意：Jittor 的 MultiheadAttention 期望输入形状为 (L, N, E)
         # 其中 L 是序列长度，N 是 batch size，E 是 embedding 维度
-        x_norm_transposed = x_norm.transpose(0, 1)  # (N, L, E) -> (L, N, E)
-        attn_output, _ = self.attn(x_norm_transposed, x_norm_transposed, x_norm_transposed)
-        attn_output = attn_output.transpose(0, 1)  # (L, N, E) -> (N, L, E)
-        attn_output = self.attn_drop(attn_output)
-        
+        # x_norm_transposed = x_norm.transpose(0, 1)  # (N, L, E) -> (L, N, E)
+        # attn_output, _ = self.attn(x_norm_transposed, x_norm_transposed, x_norm_transposed)
+        # attn_output = attn_output.transpose(0, 1)  # (L, N, E) -> (N, L, E)
+        attn_output = self.attn(x_norm, task_id)
+                
         # 残差连接
         x = x + self.dropout(attn_output)
         
@@ -462,61 +583,27 @@ class SiNet(nn.Module):
                 # 注意力层：q, k, v 分别独立
                 attn = blk.attn
 
-                q_w_key = f'{prefix}.attention.attention.query.weight'
-                q_b_key = f'{prefix}.attention.attention.query.bias'
-                k_w_key = f'{prefix}.attention.attention.key.weight'
-                k_b_key = f'{prefix}.attention.attention.key.bias'
-                v_w_key = f'{prefix}.attention.attention.value.weight'
-                v_b_key = f'{prefix}.attention.attention.value.bias'
-                out_w_key = f'{prefix}.attention.output.dense.weight'
-                out_b_key = f'{prefix}.attention.output.dense.bias'
+                # 拼接 q, k, v 权重
+                q_w = state[f'{prefix}.attention.attention.query.weight'].numpy()
+                k_w = state[f'{prefix}.attention.attention.key.weight'].numpy()
+                v_w = state[f'{prefix}.attention.attention.value.weight'].numpy()
+                qkv_w = np.concatenate([q_w, k_w, v_w], axis=0)
+                attn.qkv.weight = jt.array(qkv_w)
 
-                # 根据 attn 的结构赋值（适配 Jittor MultiheadAttention）
-                if hasattr(attn, '_qkv_proj_weight'):
-                    # 合并 qkv 权重
-                    q_w = state[q_w_key].numpy()
-                    k_w = state[k_w_key].numpy()
-                    v_w = state[v_w_key].numpy()
-                    qkv_w = np.concatenate([q_w, k_w, v_w], axis=0)
-                    attn._qkv_proj_weight = jt.array(qkv_w)
-
-                    q_b = state[q_b_key].numpy()
-                    k_b = state[k_b_key].numpy()
-                    v_b = state[v_b_key].numpy()
+                if attn.qkv.bias is not None:
+                    q_b = state[f'{prefix}.attention.attention.query.bias'].numpy()
+                    k_b = state[f'{prefix}.attention.attention.key.bias'].numpy()
+                    v_b = state[f'{prefix}.attention.attention.value.bias'].numpy()
                     qkv_b = np.concatenate([q_b, k_b, v_b], axis=0)
-                    attn._qkv_proj_bias = jt.array(qkv_b)
+                    attn.qkv.bias = jt.array(qkv_b)
 
-                    # out_proj
-                    attn.out_proj_weight = jt.array(state[out_w_key].numpy())
-                    attn.out_proj_bias   = jt.array(state[out_b_key].numpy())
+                # 加载输出投影
+                out_w = state[f'{prefix}.attention.output.dense.weight'].numpy()
+                out_b = state[f'{prefix}.attention.output.dense.bias'].numpy()
+                attn.proj.weight = jt.array(out_w)
+                attn.proj.bias = jt.array(out_b)
 
-                elif hasattr(attn, 'q_proj_weight'):
-                    attn.q_proj_weight = jt.array(state[q_w_key].numpy())
-                    attn.k_proj_weight = jt.array(state[k_w_key].numpy())
-                    attn.v_proj_weight = jt.array(state[v_w_key].numpy())
-                    if hasattr(attn, 'q_proj_bias'):
-                        attn.q_proj_bias = jt.array(state[q_b_key].numpy())
-                        attn.k_proj_bias = jt.array(state[k_b_key].numpy())
-                        attn.v_proj_bias = jt.array(state[v_b_key].numpy())
-                    if hasattr(attn, 'out_proj_weight'):
-                        attn.out_proj_weight = jt.array(state[out_w_key].numpy())
-                        attn.out_proj_bias   = jt.array(state[out_b_key].numpy())
-
-                elif hasattr(attn, 'q_proj'):
-                    attn.q_proj.weight = jt.array(state[q_w_key].numpy())
-                    attn.q_proj.bias   = jt.array(state[q_b_key].numpy())
-                    attn.k_proj.weight = jt.array(state[k_w_key].numpy())
-                    attn.k_proj.bias   = jt.array(state[k_b_key].numpy())
-                    attn.v_proj.weight = jt.array(state[v_w_key].numpy())
-                    attn.v_proj.bias   = jt.array(state[v_b_key].numpy())
-                    if hasattr(attn, 'out_proj'):
-                        attn.out_proj.weight = jt.array(state[out_w_key].numpy())
-                        attn.out_proj.bias   = jt.array(state[out_b_key].numpy())
-                else:
-                    print(f"  [⚠] block {i} attn: unknown structure, skipped")
-                    continue
-
-                print(f"  [✓] block {i} loaded")
+                print(f"  [✓] block {i} attention (original) loaded")
 
         print("[Load Pretrain] Finished.")
         return True
@@ -528,7 +615,7 @@ class SiNet(nn.Module):
         # 初始化权重
         # 使用 Jittor 的 kaiming_uniform_ 初始化
         # jt.init.kaiming_uniform_(head.weight, a=math.sqrt(5))
-        jt.init.gauss_(head.weight, mean=0.0, std=2.0)
+        jt.init.gauss_(head.weight, mean=0.0, std=0.01)
 
         if head.bias is not None:
             # 偏置初始化为0，而不是均匀分布
