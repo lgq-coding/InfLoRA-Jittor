@@ -2,15 +2,15 @@
 ## 1、项目介绍
 本项目是基于 Jittor 的 InfLoRA 复现，是《人工智能实践课（初级）》的第二次复现（第四次汇报）内容。<br>
 复现的论文是发表在 CVPR 2024 上的《InfLoRA: Interference-Free Low-Rank Adaptation for Continual Learning》，论文的 GitHub 链接为 https://github.com/liangyanshuo/InfLoRA ，论文的arxiv为 2404.00228 ，感谢作者对代码进行了开源，这为我的复现工作提供了非常重要的帮助，再次感谢！！！<br>
-同时，这篇文章在 PyTorch 上的复现，请参考我的另一个仓库 https://github.com/lgq-coding/InfLoRA-PyTorch
-同时，也感谢《人工智能实践课》带给我的与众不同的体验，感谢在学习与复现过程中各位老师和同学的无私帮助！
+同时，这篇文章在 PyTorch 上的复现，请参考我的另一个仓库 https://github.com/lgq-coding/InfLoRA-PyTorch <br>
+同时，也感谢《人工智能实践课》带给我的与众不同的体验，感谢在学习与复现过程中各位老师和同学的无私帮助！<br>
 以下是仓库中的文件结构及作用
 ```
 # 以下包含的文件主要是仓库中和复现相关的重要文件
 project/
 ├── configs/                         # JSON 配置文件
 ├── data/                            # 数据集存储（自动创建）
-├── logs/                            # 训练日志（如果启用）
+├── logs/                            # 训练日志（包含自复现以来所有的 log ，本次实验的成功结果请参见学习率为0.0001的 log 的20000行处）
 ├── methods/
 │   ├── base.py                      # 基础学习器类
 │   └── inflora.py                   # InfLoRA 学习器实现
@@ -19,11 +19,13 @@ project/
 │   └── vit_inflora.py               # Attention_LoRA 模块
 ├── utils/
 │   ├── toolkit.py                   # 辅助函数
+|   ├── data_manager.py              # 数据设置
 │   ├── data_manager.py              # 数据加载与划分
 │   └── factory.py                   # 模型工厂
 ├── main.py                          # 程序入口
 ├── trainer.py                       # 训练循环封装
 ├── jittor_test.py                   # Jittor 配置测试
+├── model_weight.py                  # 模型权重下载
 ├── requirements.txt                 # 依赖包列表
 └── README.md                        # 本文档
 ```
@@ -46,9 +48,18 @@ project/
 - 本次复现基于 CIFAR-100 开展复现
 - 对于CIFAR-100，本数据集可以在运行data-loader的过程中自动下载
 ## 4、尝试复现本项目
-首先，请按照第3条中提及的内容，以及available_version.ipynb文件，进行基本的数据集、环境、脚本配置。<br>
-具体命令可参考.ipynb文件<br>
-值得注意的是，在原.ipynb文件中，我先git了原作者的代码仓库，然后替换了相应的代码，相关的代码均在本仓库中<br>
-建议想要使用本项目的，可以先基于.ipynb给出的方案进行尝试，也可根据requirements.txt配置环境，然后直接运行本项目<br>
-由于本人是第一次复现，可能有很多问题，请大家谅解！！！
-
+克隆仓库：
+``` bash
+git clone https://github.com/yourusername/inflora-jittor.git
+cd inflora-jittor
+pip install -r requirements.txt
+```
+请下载预训练权重并放置在项目根目录，下载地址：https://www.modelscope.cn/models/google/vit-base-patch16-224-in21k <br>
+基本运行命令：
+``` bash
+python main.py --config configs/cifar100_inflora_debug.json
+```
+Jittor 默认使用所有可用 GPU，您可以通过环境变量限制使用特定 GPU：
+``` bash
+CUDA_VISIBLE_DEVICES=0 python main.py --config configs/cifar100_inflora_debug.json
+```
