@@ -50,7 +50,7 @@ project/
 ## 4、尝试复现本项目
 克隆仓库：
 ``` bash
-git clone https://github.com/yourusername/inflora-jittor.git
+git clone https://github.com/lgq-coding/Inflora-Jittor.git
 cd inflora-jittor
 pip install -r requirements.txt
 ```
