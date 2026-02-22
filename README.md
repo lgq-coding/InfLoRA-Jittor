@@ -59,7 +59,4 @@ pip install -r requirements.txt
 ``` bash
 python main.py --config configs/cifar100_inflora_debug.json
 ```
-Jittor 默认使用所有可用 GPU，您可以通过环境变量限制使用特定 GPU：
-``` bash
-CUDA_VISIBLE_DEVICES=0 python main.py --config configs/cifar100_inflora_debug.json
-```
+
