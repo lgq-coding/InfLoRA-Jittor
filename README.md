@@ -1,24 +1,31 @@
-# InfLoRA-PyTorch
+# InfLoRA-Jittor
 ## 1、项目介绍
-本项目是基于PyTorch的InfLoRA复现，是《人工智能实践课（初级）》的第一次复现（第二次汇报）内容。<br>
-复现的论文是发表在 CVPR 2024 上的《InfLoRA: Interference-Free Low-Rank Adaptation for Continual Learning》，论文的GitHub链接为 https://github.com/liangyanshuo/InfLoRA ，论文的arxiv为 2404.00228 ，感谢作者对代码进行了开源，这为我的复现工作提供了非常重要的帮助，再次感谢！！！<br>
+本项目是基于 Jittor 的 InfLoRA 复现，是《人工智能实践课（初级）》的第二次复现（第四次汇报）内容。<br>
+复现的论文是发表在 CVPR 2024 上的《InfLoRA: Interference-Free Low-Rank Adaptation for Continual Learning》，论文的 GitHub 链接为 https://github.com/liangyanshuo/InfLoRA ，论文的arxiv为 2404.00228 ，感谢作者对代码进行了开源，这为我的复现工作提供了非常重要的帮助，再次感谢！！！<br>
+同时，这篇文章在 PyTorch 上的复现，请参考我的另一个仓库 https://github.com/lgq-coding/InfLoRA-PyTorch
 同时，也感谢《人工智能实践课》带给我的与众不同的体验，感谢在学习与复现过程中各位老师和同学的无私帮助！
 以下是仓库中的文件结构及作用
 ```
 # 以下包含的文件主要是仓库中和复现相关的重要文件
 project/
-├── configs/
-│ ├── cifar100_inflora.json # 20 epochs 版本
-│ └── cifar100_inflora_debug.json # 2 epochs 版本
-├── models/ # 具体的模型
-├── methods/ # 相关的方法目录，包含 InfLoRA 的实现
-├── utills/ # 相关的工具文件
-├── 随记.txt # 这是本人在复现过程中的随手记录，包含若干的错误log
-├── cifar100_inflora.log # 这是保留的效果最佳的log文件
-├── README.md
-├── main.py
-├── trainer.py
-└── requirements.txt # 这是需要的一些包
+├── configs/                         # JSON 配置文件
+├── data/                            # 数据集存储（自动创建）
+├── logs/                            # 训练日志（如果启用）
+├── methods/
+│   ├── base.py                      # 基础学习器类
+│   └── inflora.py                   # InfLoRA 学习器实现
+├── models/
+│   ├── sinet_inflora.py             # SiNet（ViT + LoRA）定义
+│   └── vit_inflora.py               # Attention_LoRA 模块
+├── utils/
+│   ├── toolkit.py                   # 辅助函数
+│   ├── data_manager.py              # 数据加载与划分
+│   └── factory.py                   # 模型工厂
+├── main.py                          # 程序入口
+├── trainer.py                       # 训练循环封装
+├── jittor_test.py                   # Jittor 配置测试
+├── requirements.txt                 # 依赖包列表
+└── README.md                        # 本文档
 ```
 ## 2、论文介绍
 ### 2.1 简要概括
@@ -30,21 +37,14 @@ project/
 ### 2.3 其他信息
 本文的方法同样可以扩展到自监督学习的模型，还能结合类对齐方法。<br>
 这篇文章运用线性代数知识，简单而优美，比较直观。
-## 3、复现内容以及复现的心路历程
+## 3、复现内容
 ### 3.1 使用的平台
-- Google Colab
-- GPU: T4(16GB)
+- AutoDL 的 GPU + VSCode
+- GPU: RTX 4090 (24GB)
 - 相关的包请查看 requirements.txt
 ### 3.2 数据集
-- 可以先创造一个 data/ 文件夹
+- 本次复现基于 CIFAR-100 开展复现
 - 对于CIFAR-100，本数据集可以在运行data-loader的过程中自动下载
-- 对于ImageNet-R，本数据集可从该网址下载： https://people.eecs.berkeley.edu/~hendrycks/imagenet-r.tar. 解压后放入 data/ 文件夹
-- 注意本实验由于计算资源限制，未基于ImageNet-R进行实验，但整体思路一致，只需要替换数据集即可
-### 3.3 复现流程与总结：
-- 首先更改由于版本因素而导致的报错，保证pytorch和torchvision使用一个较新的版本，而timm使用一个较旧的版本，以避免报错。
-- 然后对于numpy形式的向量和tensor的混用进行了修复，统一采取torch版本的，包括矩阵乘法和奇异值分解等方法。
-- 由此整体没有很大的错误，但之后在训练到task2的时候，由于索引越界报错，推断是因为没有及时创建LoRA导致，然后借助ai试着进行修复，之后训练过程可以正常进行，但是训练得到的准确率从task2开始急剧下降，且此后的变化趋势明显改变。
-- 推断可能是因为没有正确的构建矩阵B，或者是直接利用了空白的LoRA块，之后结合具体的源码进行理解和修复。最终发现在梯度空间更新过程中，将A、B矩阵给搞反了，最终历经约2周的时间把代码给搞通了。
 ## 4、尝试复现本项目
 首先，请按照第3条中提及的内容，以及available_version.ipynb文件，进行基本的数据集、环境、脚本配置。<br>
 具体命令可参考.ipynb文件<br>
